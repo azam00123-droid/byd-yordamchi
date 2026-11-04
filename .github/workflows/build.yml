@@ -137,7 +137,7 @@ jobs:
           import android.os.Looper
 
           /**
-           * Oldindan tayyorlangan o'zbekcha ovozli javoblarni (assets/ovoz/*.mp3) ijro etadi.
+           * Oldindan tayyorlangan o'zbekcha ovozli javoblarni (assets/ovoz papkasidagi mp3 fayllar) ijro etadi.
            * Gapirayotganda musiqa ovozini pasaytiradi va mikrofonni vaqtincha to'xtatadi.
            */
           class Ovoz(private val ctx: Context) {
@@ -205,7 +205,7 @@ jobs:
 
               private fun toxtatIchki() {
                   navbat.clear()
-                  player?.let { try { it.stop() } catch (_: Exception) {}; it.release() }
+                  player?.let { try { it.stop() } catch (e: Exception) {}; it.release() }
                   player = null
               }
 
@@ -325,7 +325,7 @@ jobs:
                           addAction(Intent.ACTION_USER_PRESENT)
                       })
                       qabulQilgich = true
-                  } catch (_: Exception) {}
+                  } catch (e: Exception) {}
 
                   if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                       != PackageManager.PERMISSION_GRANTED
@@ -379,7 +379,7 @@ jobs:
                           SystemClock.elapsedRealtime() + AlarmManager.INTERVAL_FIFTEEN_MINUTES,
                           AlarmManager.INTERVAL_FIFTEEN_MINUTES, pi
                       )
-                  } catch (_: Exception) {}
+                  } catch (e: Exception) {}
               }
 
               override fun onTaskRemoved(rootIntent: Intent?) {
@@ -392,7 +392,7 @@ jobs:
                       )
                       getSystemService(AlarmManager::class.java)
                           .set(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 3000, pi)
-                  } catch (_: Exception) {}
+                  } catch (e: Exception) {}
                   super.onTaskRemoved(rootIntent)
               }
 
@@ -401,7 +401,7 @@ jobs:
 
               override fun onDestroy() {
                   handler.removeCallbacksAndMessages(null)
-                  if (qabulQilgich) try { unregisterReceiver(ekranQabul) } catch (_: Exception) {}
+                  if (qabulQilgich) try { unregisterReceiver(ekranQabul) } catch (e: Exception) {}
                   speech?.stop()
                   speech?.shutdown()
                   if (::ovoz.isInitialized) ovoz.yop()
