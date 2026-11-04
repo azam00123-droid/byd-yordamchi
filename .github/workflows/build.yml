@@ -73,6 +73,8 @@ jobs:
               <uses-permission android:name="android.permission.READ_CONTACTS" />
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
 
               <application
                   android:label="BYD Yordamchi"
@@ -97,6 +99,9 @@ jobs:
                           <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                           <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
                           <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                          <action android:name="android.bluetooth.device.action.ACL_CONNECTED" />
+                          <action android:name="android.bluetooth.a2dp.profile.action.CONNECTION_STATE_CHANGED" />
+                          <action android:name="android.bluetooth.headset.profile.action.CONNECTION_STATE_CHANGED" />
                       </intent-filter>
                   </receiver>
               </application>
@@ -109,10 +114,129 @@ jobs:
           import android.content.Context
           import android.content.Intent
 
-          /** Mashina (planshet) yoqilganda yordamchini avtomatik ishga tushiradi. */
+          /**
+           * Mashina yoqilganda, Bluetooth ulanganda va har 15 daqiqada (qo'riqchi)
+           * yordamchi ishlayotganini tekshiradi va kerak bo'lsa qayta ishga tushiradi.
+           */
           class BootReceiver : BroadcastReceiver() {
               override fun onReceive(context: Context, intent: Intent) {
                   VoiceService.start(context)
+              }
+          }
+          YORDAMCHI_EOF
+          cat > app/src/main/java/uz/byd/yordamchi/Ovoz.kt <<'YORDAMCHI_EOF'
+          package uz.byd.yordamchi
+
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioFocusRequest
+          import android.media.AudioManager
+          import android.media.MediaPlayer
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+
+          /**
+           * Oldindan tayyorlangan o'zbekcha ovozli javoblarni (assets/ovoz/*.mp3) ijro etadi.
+           * Gapirayotganda musiqa ovozini pasaytiradi va mikrofonni vaqtincha to'xtatadi.
+           */
+          class Ovoz(private val ctx: Context) {
+
+              /** true — gapirishni boshladi, false — tugatdi */
+              var gapirayotganda: ((Boolean) -> Unit)? = null
+
+              private val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+              private val handler = Handler(Looper.getMainLooper())
+              private val navbat = ArrayDeque<String>()
+              private var player: MediaPlayer? = null
+              private var fokus: AudioFocusRequest? = null
+              private val attrs = AudioAttributes.Builder()
+                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                  .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                  .build()
+
+              /** Ovoz fayllari APK ichida bormi */
+              val tayyor: Boolean = bor("salom")
+
+              fun bor(kalit: String): Boolean = try {
+                  ctx.assets.openFd("ovoz/$kalit.mp3").close(); true
+              } catch (e: Exception) { false }
+
+              fun gapir(kalitlar: List<String>) {
+                  handler.post {
+                      toxtatIchki()
+                      val mavjud = kalitlar.filter { bor(it) }
+                      if (mavjud.isEmpty()) { tugadi(); return@post }
+                      navbat.addAll(mavjud)
+                      fokusOl()
+                      gapirayotganda?.invoke(true)
+                      keyingi()
+                  }
+              }
+
+              fun yop() {
+                  handler.removeCallbacksAndMessages(null)
+                  toxtatIchki()
+                  fokusQaytar()
+              }
+
+              private fun keyingi() {
+                  val k = navbat.removeFirstOrNull()
+                  if (k == null) { tugadi(); return }
+                  try {
+                      val afd = ctx.assets.openFd("ovoz/$k.mp3")
+                      val mp = MediaPlayer()
+                      mp.setAudioAttributes(attrs)
+                      mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                      afd.close()
+                      mp.setOnCompletionListener {
+                          it.release(); if (player === it) player = null; keyingi()
+                      }
+                      mp.setOnErrorListener { m, _, _ ->
+                          m.release(); if (player === m) player = null; keyingi(); true
+                      }
+                      mp.prepare()
+                      player = mp
+                      mp.start()
+                  } catch (e: Exception) {
+                      keyingi()
+                  }
+              }
+
+              private fun toxtatIchki() {
+                  navbat.clear()
+                  player?.let { try { it.stop() } catch (_: Exception) {}; it.release() }
+                  player = null
+              }
+
+              private fun tugadi() {
+                  fokusQaytar()
+                  // aks-sado mikrofonga tushmasligi uchun biroz kutamiz
+                  handler.postDelayed({
+                      if (player == null && navbat.isEmpty()) gapirayotganda?.invoke(false)
+                  }, 350)
+              }
+
+              @Suppress("DEPRECATION")
+              private fun fokusOl() {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val r = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                          .setAudioAttributes(attrs).build()
+                      fokus = r
+                      audio.requestAudioFocus(r)
+                  } else {
+                      audio.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun fokusQaytar() {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      fokus?.let { audio.abandonAudioFocusRequest(it) }
+                      fokus = null
+                  } else {
+                      audio.abandonAudioFocus(null)
+                  }
               }
           }
           YORDAMCHI_EOF
@@ -120,13 +244,16 @@ jobs:
           package uz.byd.yordamchi
 
           import android.Manifest
+          import android.app.AlarmManager
           import android.app.Notification
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
           import android.app.Service
+          import android.content.BroadcastReceiver
           import android.content.Context
           import android.content.Intent
+          import android.content.IntentFilter
           import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
           import android.media.AudioManager
@@ -145,6 +272,7 @@ jobs:
           import org.vosk.android.SpeechService
           import org.vosk.android.StorageService
           import java.io.IOException
+          import java.util.Random
 
           /** Fonda doim tinglab turadigan xizmat. "Yordamchi" so'zini eshitsa buyruqni bajaradi. */
           class VoiceService : Service(), RecognitionListener {
@@ -152,24 +280,52 @@ jobs:
               companion object {
                   private const val KANAL = "yordamchi"
                   private const val NOTIF_ID = 1
+                  const val TEKSHIR = "uz.byd.yordamchi.TEKSHIR"
+                  private const val SALOM_ORALIGI = 20 * 60 * 1000L   // 20 daqiqada bir martadan ko'p salomlashmaydi
                   @Volatile var holat: String = "To'xtagan"
 
                   fun start(ctx: Context) {
-                      ContextCompat.startForegroundService(ctx, Intent(ctx, VoiceService::class.java))
+                      try {
+                          ContextCompat.startForegroundService(ctx, Intent(ctx, VoiceService::class.java))
+                      } catch (e: Exception) { /* tizim ruxsat bermadi — qo'riqchi keyinroq qayta urinadi */ }
                   }
               }
 
               private var model: Model? = null
               private var speech: SpeechService? = null
               private lateinit var buyruqlar: CommandProcessor
+              private lateinit var ovoz: Ovoz
               private var kutishGacha = 0L
               private val handler = Handler(Looper.getMainLooper())
               private val tone by lazy { ToneGenerator(AudioManager.STREAM_MUSIC, 90) }
+              private val tasodif = Random()
+              private var qabulQilgich = false
+
+              /** Mashina uyqudan uyg'onib, ekran yonganda */
+              private val ekranQabul = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      if (model != null) {
+                          tinglashniBoshla()
+                          salomlash()
+                      }
+                  }
+              }
 
               override fun onCreate() {
                   super.onCreate()
                   oldingaChiqar("Yuklanmoqda...")
                   buyruqlar = CommandProcessor(this)
+                  ovoz = Ovoz(this)
+                  ovoz.gapirayotganda = { band -> speech?.setPause(band) }
+                  qoriqchiniRejala()
+
+                  try {
+                      registerReceiver(ekranQabul, IntentFilter().apply {
+                          addAction(Intent.ACTION_SCREEN_ON)
+                          addAction(Intent.ACTION_USER_PRESENT)
+                      })
+                      qabulQilgich = true
+                  } catch (_: Exception) {}
 
                   if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                       != PackageManager.PERMISSION_GRANTED
@@ -180,12 +336,17 @@ jobs:
                   }
 
                   StorageService.unpack(this, "model-uz", "model",
-                      { m: Model -> model = m; tinglashniBoshla() },
+                      { m: Model ->
+                          model = m
+                          tinglashniBoshla()
+                          salomlash()
+                      },
                       { e: IOException -> yangila("Model yuklanmadi: ${e.message}") })
               }
 
               private fun tinglashniBoshla() {
                   try {
+                      speech?.stop()
                       speech?.shutdown()
                       val rec = Recognizer(model, 16000f)
                       speech = SpeechService(rec, 16000f).also { it.startListening(this) }
@@ -196,14 +357,54 @@ jobs:
                   }
               }
 
+              private fun salomlash() {
+                  val p = getSharedPreferences("yordamchi", MODE_PRIVATE)
+                  val hozir = System.currentTimeMillis()
+                  if (hozir - p.getLong("oxirgi_salom", 0L) < SALOM_ORALIGI) return
+                  p.edit().putLong("oxirgi_salom", hozir).apply()
+                  if (ovoz.tayyor) ovoz.gapir(listOf("salom"))
+                  else tone.startTone(ToneGenerator.TONE_PROP_ACK, 300)
+              }
+
+              /** Har 15 daqiqada tekshirib turadi: xizmat o'lgan bo'lsa qayta tiriltiradi */
+              private fun qoriqchiniRejala() {
+                  try {
+                      val pi = PendingIntent.getBroadcast(
+                          this, 7,
+                          Intent(this, BootReceiver::class.java).setAction(TEKSHIR),
+                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                      )
+                      getSystemService(AlarmManager::class.java).setInexactRepeating(
+                          AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                          SystemClock.elapsedRealtime() + AlarmManager.INTERVAL_FIFTEEN_MINUTES,
+                          AlarmManager.INTERVAL_FIFTEEN_MINUTES, pi
+                      )
+                  } catch (_: Exception) {}
+              }
+
+              override fun onTaskRemoved(rootIntent: Intent?) {
+                  // Ilova ro'yxatdan surib yopilsa ham 3 soniyadan keyin qayta ishga tushadi
+                  try {
+                      val pi = PendingIntent.getBroadcast(
+                          this, 8,
+                          Intent(this, BootReceiver::class.java).setAction(TEKSHIR),
+                          PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                      )
+                      getSystemService(AlarmManager::class.java)
+                          .set(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 3000, pi)
+                  } catch (_: Exception) {}
+                  super.onTaskRemoved(rootIntent)
+              }
+
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
               override fun onBind(intent: Intent?): IBinder? = null
 
               override fun onDestroy() {
                   handler.removeCallbacksAndMessages(null)
+                  if (qabulQilgich) try { unregisterReceiver(ekranQabul) } catch (_: Exception) {}
                   speech?.stop()
                   speech?.shutdown()
-                  if (::buyruqlar.isInitialized) buyruqlar.shutdown()
+                  if (::ovoz.isInitialized) ovoz.yop()
                   holat = "To'xtagan"
                   super.onDestroy()
               }
@@ -232,8 +433,9 @@ jobs:
                       chaqiruv >= 0 -> {
                           val qolgan = sozlar.drop(chaqiruv + 1).joinToString(" ")
                           if (qolgan.isBlank()) {
-                              kutishGacha = hozir + 7000
-                              tone.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
+                              kutishGacha = hozir + 9000
+                              if (ovoz.tayyor) ovoz.gapir(listOf("eshit_${tasodif.nextInt(3)}"))
+                              else tone.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
                               yangila("Eshitaman...")
                           } else bajar(qolgan)
                       }
@@ -243,7 +445,8 @@ jobs:
 
               private fun bajar(buyruq: String) {
                   val n = buyruqlar.execute(buyruq)
-                  tone.startTone(if (n.ok) ToneGenerator.TONE_PROP_ACK else ToneGenerator.TONE_PROP_NACK, 250)
+                  if (ovoz.tayyor) ovoz.gapir(n.ovozlar)
+                  else tone.startTone(if (n.ok) ToneGenerator.TONE_PROP_ACK else ToneGenerator.TONE_PROP_NACK, 250)
                   yangila(n.matn)
               }
 
@@ -293,16 +496,16 @@ jobs:
           import android.media.AudioManager
           import android.net.Uri
           import android.provider.ContactsContract
-          import android.speech.tts.TextToSpeech
           import android.view.KeyEvent
           import androidx.core.content.ContextCompat
           import java.util.Calendar
           import java.util.Locale
 
           /** O'zbekcha buyruqlarni tushunib, bajaradi. */
-          class CommandProcessor(private val ctx: Context) : TextToSpeech.OnInitListener {
+          class CommandProcessor(private val ctx: Context) {
 
-              data class Natija(val ok: Boolean, val matn: String)
+              /** ok — bajarildimi, matn — ekranda ko'rinadi, ovozlar — assets/ovoz ichidagi javob fayllari */
+              data class Natija(val ok: Boolean, val matn: String, val ovozlar: List<String>)
 
               companion object {
                   const val YANDEX_NAVI = "ru.yandex.yandexnavi"
@@ -338,52 +541,36 @@ jobs:
 
               private val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
               private val pm: PackageManager = ctx.packageManager
-              private var tts: TextToSpeech? = TextToSpeech(ctx.applicationContext, this)
-              private var ttsTayyor = false
-              private var ttsUz = false
-
-              override fun onInit(status: Int) {
-                  if (status != TextToSpeech.SUCCESS) return
-                  val r = tts?.setLanguage(Locale("uz", "UZ")) ?: TextToSpeech.LANG_NOT_SUPPORTED
-                  ttsUz = r >= TextToSpeech.LANG_AVAILABLE
-                  if (!ttsUz) tts?.setLanguage(Locale("ru", "RU"))
-                  ttsTayyor = true
-              }
-
-              private fun gapir(uz: String, ru: String) {
-                  if (ttsTayyor) tts?.speak(if (ttsUz) uz else ru, TextToSpeech.QUEUE_FLUSH, null, "yordamchi")
-              }
-
-              fun shutdown() { tts?.shutdown(); tts = null }
-
               fun execute(raw: String): Natija {
                   val t = normalize(raw)
-                  if (t.isBlank()) return Natija(false, "Bo'sh buyruq")
+                  if (t.isBlank()) return Natija(false, "Bo'sh buyruq", listOf("tushunmadim"))
                   return when {
                       has(t, "soat necha", "soat nechi", "vaqt necha", "hozir soat") -> vaqt()
                       has(t, "ovozni ochir", "ovozsiz") ->
-                          ovozBir(AudioManager.ADJUST_MUTE, "Ovoz o'chirildi")
+                          ovozBir(AudioManager.ADJUST_MUTE, "Ovoz o'chirildi", "ovoz_ochir")
                       has(t, "ovozni yoq", "ovozni qaytar") ->
-                          ovozBir(AudioManager.ADJUST_UNMUTE, "Ovoz yoqildi")
+                          ovozBir(AudioManager.ADJUST_UNMUTE, "Ovoz yoqildi", "ovoz_yoq")
                       has(t, "ovozni oshir", "balandroq", "baland qil", "kuchaytir", "ovozni kotar") ->
-                          ovoz(AudioManager.ADJUST_RAISE, "Ovoz oshirildi")
+                          ovoz(AudioManager.ADJUST_RAISE, "Ovoz oshirildi", "ovoz_oshir")
                       has(t, "ovozni pasayt", "pastroq", "past qil", "sekinroq") ->
-                          ovoz(AudioManager.ADJUST_LOWER, "Ovoz pasaytirildi")
+                          ovoz(AudioManager.ADJUST_LOWER, "Ovoz pasaytirildi", "ovoz_pasayt")
                       has(t, "keyingi", "boshqa qoshiq", "boshqasini") ->
-                          media(KeyEvent.KEYCODE_MEDIA_NEXT, "Keyingi qo'shiq")
+                          media(KeyEvent.KEYCODE_MEDIA_NEXT, "Keyingi qo'shiq", "keyingi")
                       has(t, "oldingi", "avvalgi") ->
-                          media(KeyEvent.KEYCODE_MEDIA_PREVIOUS, "Oldingi qo'shiq")
+                          media(KeyEvent.KEYCODE_MEDIA_PREVIOUS, "Oldingi qo'shiq", "oldingi")
                       has(t, "toxtat", "pauza", "jim bol") ->
-                          media(KeyEvent.KEYCODE_MEDIA_PAUSE, "To'xtatildi")
+                          media(KeyEvent.KEYCODE_MEDIA_PAUSE, "To'xtatildi", "toxtat")
                       has(t, "musiqa", "qoshiq", "davom et") ->
-                          media(KeyEvent.KEYCODE_MEDIA_PLAY, "Musiqa yoqildi")
+                          media(KeyEvent.KEYCODE_MEDIA_PLAY, "Musiqa yoqildi", "musiqa")
                       has(t, "qongiroq", "qongroq", "telefon qil", "chaqir") -> qongiroq(t)
                       has(t, "olib bor", "yol korsat", "boramiz", "boraman", "borish", "navigator", "manzil", "marshrut") -> yol(t)
                       Regex("\\boch(ib ber)?\\b").containsMatchIn(t) -> ilovaOch(t)
-                      else -> {
-                          gapir("Tushunmadim", "Не поняла")
-                          Natija(false, "Tushunmadim: $raw")
-                      }
+                      has(t, "rahmat", "raxmat", "tashakkur") -> Natija(true, "Arzimaydi!", listOf("rahmat"))
+                      has(t, "qalaysan", "yaxshimisan", "salom", "assalomu") ->
+                          Natija(true, "Yaxshi, rahmat!", listOf("qalay"))
+                      has(t, "kimsan", "isming nima", "nima qila olasan") ->
+                          Natija(true, "Men sizning yordamchingizman", listOf("kimsan"))
+                      else -> Natija(false, "Tushunmadim: $raw", listOf("tushunmadim"))
                   }
               }
 
@@ -395,35 +582,35 @@ jobs:
                   val h = c.get(Calendar.HOUR_OF_DAY)
                   val m = c.get(Calendar.MINUTE)
                   val s = String.format(Locale.ROOT, "%02d:%02d", h, m)
-                  gapir("Soat $h dan $m daqiqa o'tdi", "Время $s")
-                  return Natija(true, "Soat $s")
+                  val ovozlar = if (m == 0) listOf("soat_$h") else listOf("soatdan_$h", "daq_$m")
+                  return Natija(true, "Soat $s", ovozlar)
               }
 
               // ---- Ovoz va musiqa ----
-              private fun ovoz(dir: Int, msg: String): Natija {
+              private fun ovoz(dir: Int, msg: String, javob: String): Natija {
                   repeat(3) { audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, AudioManager.FLAG_SHOW_UI) }
-                  return Natija(true, msg)
+                  return Natija(true, msg, listOf(javob))
               }
 
-              private fun ovozBir(dir: Int, msg: String): Natija {
+              private fun ovozBir(dir: Int, msg: String, javob: String): Natija {
                   audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, AudioManager.FLAG_SHOW_UI)
-                  return Natija(true, msg)
+                  return Natija(true, msg, listOf(javob))
               }
 
-              private fun media(code: Int, msg: String): Natija {
+              private fun media(code: Int, msg: String, javob: String): Natija {
                   audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
                   audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
-                  return Natija(true, msg)
+                  return Natija(true, msg, listOf(javob))
               }
 
               // ---- Qo'ng'iroq ----
               private fun qongiroq(t: String): Natija {
                   val ism = maqsad(t, listOf("qongiroq qil", "qongiroq", "qongroq", "telefon qil", "chaqir"))
-                  if (ism.isBlank()) return Natija(false, "Kimga qo'ng'iroq qilay?")
-                  if (!ruxsat(Manifest.permission.READ_CONTACTS)) return Natija(false, "Kontaktlarga ruxsat berilmagan")
-                  val raqam = kontaktTop(ism) ?: return Natija(false, "\"$ism\" kontakti topilmadi")
+                  if (ism.isBlank()) return Natija(false, "Kimga qo'ng'iroq qilay?", listOf("kimga"))
+                  if (!ruxsat(Manifest.permission.READ_CONTACTS)) return Natija(false, "Kontaktlarga ruxsat berilmagan", listOf("ruxsat_yoq"))
+                  val raqam = kontaktTop(ism) ?: return Natija(false, "\"$ism\" kontakti topilmadi", listOf("kontakt_yoq"))
                   val action = if (ruxsat(Manifest.permission.CALL_PHONE)) Intent.ACTION_CALL else Intent.ACTION_DIAL
-                  return och(Intent(action, Uri.parse("tel:" + Uri.encode(raqam))), "$ism ga qo'ng'iroq qilinmoqda")
+                  return och(Intent(action, Uri.parse("tel:" + Uri.encode(raqam))), "$ism ga qo'ng'iroq qilinmoqda", "qongiroq")
               }
 
               private fun kontaktTop(ism: String): String? {
@@ -456,23 +643,23 @@ jobs:
                   )
                   if (joy.isBlank()) {
                       for (p in listOf(YANDEX_NAVI, YANDEX_MAPS, GOOGLE_MAPS)) {
-                          pm.getLaunchIntentForPackage(p)?.let { return och(it, "Navigator ochildi") }
+                          pm.getLaunchIntentForPackage(p)?.let { return och(it, "Navigator ochildi", "navigator") }
                       }
-                      return Natija(false, "Navigator topilmadi")
+                      return Natija(false, "Navigator topilmadi", listOf("navigator_yoq"))
                   }
                   val variantlar = listOf(
                       Intent(Intent.ACTION_VIEW, Uri.parse("yandexnavi://map_search?text=" + Uri.encode(joy))).setPackage(YANDEX_NAVI),
                       Intent(Intent.ACTION_VIEW, Uri.parse("yandexmaps://maps.yandex.ru/?text=" + Uri.encode(joy))).setPackage(YANDEX_MAPS),
                       Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(joy)))
                   )
-                  for (i in variantlar) if (i.resolveActivity(pm) != null) return och(i, "Yo'l: $joy")
-                  return Natija(false, "Xarita ilovasi topilmadi")
+                  for (i in variantlar) if (i.resolveActivity(pm) != null) return och(i, "Yo'l: $joy", "yol")
+                  return Natija(false, "Xarita ilovasi topilmadi", listOf("navigator_yoq"))
               }
 
               // ---- Ilova ochish ----
               private fun ilovaOch(t: String): Natija {
                   val nom = maqsad(t, listOf("ochib ber", "och", "ilovasini", "ilovani", "dasturini", "dasturni"))
-                  if (nom.isBlank()) return Natija(false, "Qaysi ilovani ochay?")
+                  if (nom.isBlank()) return Natija(false, "Qaysi ilovani ochay?", listOf("qaysi_ilova"))
                   val apps = pm.queryIntentActivities(
                       Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
                   )
@@ -480,9 +667,9 @@ jobs:
                   val pkg = nomlar.firstOrNull { it.first == nom }?.second
                       ?: nomlar.firstOrNull { it.first.contains(nom) }?.second
                       ?: nomlar.firstOrNull { it.first.length >= 3 && nom.contains(it.first) }?.second
-                      ?: return Natija(false, "\"$nom\" ilovasi topilmadi")
-                  val i = pm.getLaunchIntentForPackage(pkg) ?: return Natija(false, "Ochib bo'lmadi")
-                  return och(i, "$nom ochildi")
+                      ?: return Natija(false, "\"$nom\" ilovasi topilmadi", listOf("ilova_yoq"))
+                  val i = pm.getLaunchIntentForPackage(pkg) ?: return Natija(false, "Ochib bo'lmadi", listOf("xato"))
+                  return och(i, "$nom ochildi", "ilova_och")
               }
 
               // ---- Yordamchi funksiyalar ----
@@ -502,12 +689,12 @@ jobs:
               private fun ruxsat(p: String) =
                   ContextCompat.checkSelfPermission(ctx, p) == PackageManager.PERMISSION_GRANTED
 
-              private fun och(i: Intent, msg: String): Natija = try {
+              private fun och(i: Intent, msg: String, javob: String): Natija = try {
                   i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                   ctx.startActivity(i)
-                  Natija(true, msg)
+                  Natija(true, msg, listOf(javob))
               } catch (e: Exception) {
-                  Natija(false, "Xato: ${e.message}")
+                  Natija(false, "Xato: ${e.message}", listOf("xato"))
               }
           }
           YORDAMCHI_EOF
@@ -523,6 +710,7 @@ jobs:
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
+          import android.os.PowerManager
           import android.provider.Settings
           import android.widget.Button
           import android.widget.EditText
@@ -536,6 +724,7 @@ jobs:
               private lateinit var holatMatn: TextView
               private val handler = Handler(Looper.getMainLooper())
               private var sinov: CommandProcessor? = null
+              private var sinovOvoz: Ovoz? = null
 
               private val yangilash = object : Runnable {
                   override fun run() {
@@ -555,6 +744,7 @@ jobs:
                   📞 Qo'ng'iroq: akamga qo'ng'iroq qil
                   📱 Ilova: telegramni och
                   🕐 Vaqt: soat necha
+                  💬 Suhbat: rahmat · qalaysan · kimsan
               """.trimIndent()
 
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -576,13 +766,16 @@ jobs:
                   root.addView(tugma("1. Ruxsatlarni berish") { ruxsatSora() })
                   root.addView(tugma("2. Boshqa ilovalar ustida ochish ruxsati") { overlayRuxsati() })
                   root.addView(tugma("3. Yordamchini ishga tushirish") { VoiceService.start(this) })
+                  root.addView(tugma("4. Batareya cheklovini o'chirish") { batareya() })
                   root.addView(tugma("To'xtatish") { stopService(Intent(this, VoiceService::class.java)) })
 
                   val kirish = EditText(this).apply { hint = "Buyruqni yozib sinab ko'ring" }
                   root.addView(kirish)
                   root.addView(tugma("Sinash") {
                       val p = sinov ?: CommandProcessor(this).also { sinov = it }
-                      Toast.makeText(this, p.execute(kirish.text.toString()).matn, Toast.LENGTH_LONG).show()
+                      val n = p.execute(kirish.text.toString())
+                      (sinovOvoz ?: Ovoz(this).also { sinovOvoz = it }).gapir(n.ovozlar)
+                      Toast.makeText(this, n.matn, Toast.LENGTH_LONG).show()
                   })
                   root.addView(matn(yordam, 16f))
 
@@ -592,7 +785,7 @@ jobs:
 
               override fun onResume() { super.onResume(); handler.post(yangilash) }
               override fun onPause() { handler.removeCallbacks(yangilash); super.onPause() }
-              override fun onDestroy() { sinov?.shutdown(); super.onDestroy() }
+              override fun onDestroy() { sinovOvoz?.yop(); super.onDestroy() }
 
               private fun ruxsatSora() {
                   val r = mutableListOf(
@@ -618,6 +811,21 @@ jobs:
                   }
               }
 
+              private fun batareya() {
+                  val pm = getSystemService(PowerManager::class.java)
+                  if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                      Toast.makeText(this, "Allaqachon o'chirilgan ✓", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  try {
+                      startActivity(
+                          Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+                      )
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Sozlamalar → Batareya bo'limidan qo'lda o'chiring", Toast.LENGTH_LONG).show()
+                  }
+              }
+
               private fun overlayRuxsati() {
                   try {
                       startActivity(
@@ -630,7 +838,7 @@ jobs:
           }
           YORDAMCHI_EOF
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -639,13 +847,99 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: O'zbekcha ovoz modelini yuklash
+      - name: O'zbekcha ovoz tanish modelini yuklash
         run: |
           wget -q https://alphacephei.com/vosk/models/vosk-model-small-uz-0.22.zip
           unzip -q vosk-model-small-uz-0.22.zip
           rm -rf app/src/main/assets/model-uz
           mv vosk-model-small-uz-0.22 app/src/main/assets/model-uz
           cat /proc/sys/kernel/random/uuid > app/src/main/assets/model-uz/uuid
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: O'zbekcha javob ovozlarini yaratish (Sardor)
+        continue-on-error: true
+        env:
+          OVOZ: uz-UZ-SardorNeural
+        run: |
+          pip install -q edge-tts
+          cat > ovozlar.py <<'PYEOF'
+          # O'zbekcha javob ovozlarini yaratadi (Microsoft neyron ovozi, edge-tts orqali)
+          import asyncio, os, edge_tts
+
+          OVOZ = os.environ.get("OVOZ", "uz-UZ-SardorNeural")
+          OUT = "app/src/main/assets/ovoz"
+          os.makedirs(OUT, exist_ok=True)
+
+          GAPLAR = {
+              "salom": "Assalomu alaykum! Men tayyorman. Kerak bo'lsam, Yordamchi deb chaqiring.",
+              "eshit_0": "Labbay?",
+              "eshit_1": "Ha, eshitaman.",
+              "eshit_2": "Buyuring.",
+              "tushunmadim": "Kechirasiz, tushunmadim. Qaytadan ayting.",
+              "xato": "Kechirasiz, buni bajara olmadim.",
+              "musiqa": "Xo'p, musiqani yoqdim.",
+              "toxtat": "Musiqa to'xtatildi.",
+              "keyingi": "Keyingi qo'shiq.",
+              "oldingi": "Oldingi qo'shiq.",
+              "ovoz_oshir": "Ovozni balandlatdim.",
+              "ovoz_pasayt": "Ovozni pasaytirdim.",
+              "ovoz_ochir": "Ovoz o'chirildi.",
+              "ovoz_yoq": "Ovoz yoqildi.",
+              "yol": "Xo'p, yo'lni ochyapman.",
+              "navigator": "Navigator ochildi.",
+              "navigator_yoq": "Kechirasiz, navigator ilovasi topilmadi.",
+              "qongiroq": "Xo'p, qo'ng'iroq qilyapman.",
+              "kimga": "Kimga qo'ng'iroq qilay?",
+              "kontakt_yoq": "Kechirasiz, bunday kontakt topilmadi.",
+              "ruxsat_yoq": "Buning uchun menga ruxsat berilmagan.",
+              "ilova_och": "Ilova ochildi.",
+              "ilova_yoq": "Kechirasiz, bunday ilova topilmadi.",
+              "qaysi_ilova": "Qaysi ilovani ochay?",
+              "rahmat": "Arzimaydi! Har doim xizmatingizdaman.",
+              "qalay": "Yaxshi, rahmat! Sizga qanday yordam bera olaman?",
+              "kimsan": "Men sizning shaxsiy yordamchingizman. Musiqa, yo'l, qo'ng'iroq va ilovalarni boshqara olaman.",
+          }
+
+          BIRLAR = ["", "bir", "ikki", "uch", "to'rt", "besh", "olti", "yetti", "sakkiz", "to'qqiz"]
+          ONLAR = ["", "o'n", "yigirma", "o'ttiz", "qirq", "ellik"]
+
+          def son(n):
+              if n == 0:
+                  return "nol"
+              o, b = divmod(n, 10)
+              return " ".join(x for x in (ONLAR[o], BIRLAR[b]) if x)
+
+          for h in range(24):
+              GAPLAR[f"soat_{h}"] = f"Hozir soat {son(h)} bo'ldi."
+              GAPLAR[f"soatdan_{h}"] = f"Hozir soat {son(h)}dan"
+          for m in range(1, 60):
+              GAPLAR[f"daq_{m}"] = f"{son(m)} daqiqa o'tdi."
+
+          async def bitta(kalit, matn, sem):
+              async with sem:
+                  for urinish in range(4):
+                      try:
+                          await edge_tts.Communicate(matn, OVOZ, rate="+5%").save(f"{OUT}/{kalit}.mp3")
+                          return True
+                      except Exception as e:
+                          print(f"{kalit}: {e} (qayta urinish)")
+                          await asyncio.sleep(2 + urinish * 2)
+                  return False
+
+          async def main():
+              sem = asyncio.Semaphore(6)
+              natija = await asyncio.gather(*(bitta(k, t, sem) for k, t in GAPLAR.items()))
+              print(f"Tayyor: {sum(natija)} / {len(GAPLAR)} ta ovoz")
+              if not os.path.exists(f"{OUT}/salom.mp3"):
+                  raise SystemExit("salom.mp3 yaratilmadi")
+
+          asyncio.run(main())
+          PYEOF
+          python ovozlar.py
+          ls app/src/main/assets/ovoz | wc -l
 
       - name: APK yig'ish
         run: gradle assembleDebug --no-daemon
